@@ -1,89 +1,70 @@
 #!/bin/bash
 
-# Exit immediately on unhandled errors and undefined variables.
-set -u
+set -o errexit
+set -o nounset
+set -o pipefail
 
-# Resolve the directory containing this script so that messages.sh can be
-# loaded without using a hardcoded absolute path.
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export LC_ALL=C
 
-# Import the reusable output functions.
-# shellcheck source=messages.sh
-source "${script_dir}/messages.sh"
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+messages_file="${script_directory}/messages.sh"
 
-# Require exactly one command-line argument.
+if [[ ! -r "$messages_file" ]]; then
+    echo "Error: unable to read '${messages_file}'." >&2
+    exit 1
+fi
+
+source "$messages_file"
+
 if [[ $# -ne 1 ]]; then
-    display_usage
+    echo "Usage: $0 <ELF_file>" >&2
     exit 1
 fi
 
 file_name="$1"
 
-# Confirm that the supplied path refers to an existing regular file.
 if [[ ! -f "$file_name" ]]; then
-    display_file_not_found_error
+    echo "Error: file '$file_name' does not exist." >&2
     exit 1
 fi
 
-# Confirm that the current user can read the file.
 if [[ ! -r "$file_name" ]]; then
-    echo "Error: File '${file_name}' is not readable." >&2
+    echo "Error: file '$file_name' is not readable." >&2
     exit 1
 fi
 
-# readelf returns a non-zero status when the file is not a valid ELF file.
-# LC_ALL=C keeps the output predictable regardless of the system language.
-if ! elf_header="$(LC_ALL=C readelf -h -- "$file_name" 2>/dev/null)"; then
-    display_invalid_elf_error
+if ! elf_header="$(readelf --file-header --wide "$file_name" 2>/dev/null)"; then
+    echo "Error: file '$file_name' is not a valid ELF file." >&2
     exit 1
 fi
 
-# Extract the ELF magic bytes from the readelf header.
 magic_number="$(
     printf '%s\n' "$elf_header" |
-        awk -F: '/^[[:space:]]*Magic:/ {
-            sub(/^[[:space:]]+/, "", $2)
-            print $2
-            exit
-        }'
+    sed -n 's/^[[:space:]]*Magic:[[:space:]]*//p' |
+    head -n 1
 )"
 
-# Extract whether the binary uses the ELF32 or ELF64 format.
 class="$(
     printf '%s\n' "$elf_header" |
-        awk -F: '/^[[:space:]]*Class:/ {
-            sub(/^[[:space:]]+/, "", $2)
-            print $2
-            exit
-        }'
+    sed -n 's/^[[:space:]]*Class:[[:space:]]*//p' |
+    head -n 1
 )"
 
-# The Data field describes both the encoding and byte order.
 byte_order="$(
     printf '%s\n' "$elf_header" |
-        awk -F: '/^[[:space:]]*Data:/ {
-            sub(/^[[:space:]]+/, "", $2)
-            print $2
-            exit
-        }'
+    sed -n 's/^[[:space:]]*Data:[[:space:]]*//p' |
+    sed "s/^2's complement,[[:space:]]*//" |
+    head -n 1
 )"
 
-# Extract the virtual address at which execution begins.
 entry_point_address="$(
     printf '%s\n' "$elf_header" |
-        awk -F: '/^[[:space:]]*Entry point address:/ {
-            sub(/^[[:space:]]+/, "", $2)
-            print $2
-            exit
-        }'
+    sed -n 's/^[[:space:]]*Entry point address:[[:space:]]*//p' |
+    head -n 1
 )"
 
-# Ensure all required ELF fields were successfully extracted.
-if [[ -z "$magic_number" ||
-      -z "$class" ||
-      -z "$byte_order" ||
-      -z "$entry_point_address" ]]; then
-    display_read_error
+if [[ -z "$magic_number" || -z "$class" || -z "$byte_order" || -z "$entry_point_address" ]]; then
+    echo "Error: unable to extract all required ELF header fields from '$file_name'." >&2
     exit 1
 fi
 
