@@ -1,176 +1,147 @@
 #!/usr/bin/env python3
+"""
+Z3 solver for the Dy_task0 SAT/SMT reverse-engineering challenge.
+
+Install Z3 with:
+    python3 -m pip install z3-solver
+"""
 
 from z3 import (
+    And,
     BitVec,
     BitVecVal,
+    Extract,
+    LShR,
     Or,
-    SolverFor,
-    SignExt,
-    SRem,
-    URem,
+    Solver,
+    ZeroExt,
     sat,
 )
 
-CHAR_COUNT = 24
-WIDTH = 32
+PAYLOAD_LENGTH = 24
 
+# Characters between "Holberton{" and "}".
+chars = [BitVec(f"x{i}", 8) for i in range(PAYLOAD_LENGTH)]
 
-def bv32(value: int):
-    """Create a 32-bit bit-vector constant."""
-    return BitVecVal(value & 0xFFFFFFFF, WIDTH)
+solver = Solver()
 
-
-# Each unknown flag character is represented by one byte.
-chars = [BitVec(f"char_{i}", 8) for i in range(CHAR_COUNT)]
-
-# QF_BV means quantifier-free bit-vector logic.
-solver = SolverFor("QF_BV")
-
-# Limit characters to readable ASCII.
-for char in chars:
-    solver.add(char >= 0x21)
-    solver.add(char <= 0x7E)
-
-# Optional, but often useful for CTF flags:
-# letters, digits and underscore only.
+# Allowed characters: lowercase letters, digits, underscores and '?'.
 for char in chars:
     solver.add(
         Or(
             char == ord("_"),
-            char >= ord("0"),
-            char <= ord("9"),
-            char >= ord("A"),
-            char <= ord("Z"),
-            char >= ord("a"),
-            char <= ord("z"),
+            char == ord("?"),
+            And(char >= ord("0"), char <= ord("9")),
+            And(char >= ord("a"), char <= ord("z")),
         )
     )
 
-accumulator_a = bv32(0)
-accumulator_b = bv32(1)
-accumulator_c = bv32(0)
-accumulator_d = bv32(1)
+# Four 32-bit accumulators reconstructed from verify_flag().
+sum_acc = BitVecVal(0, 32)
+product_acc = BitVecVal(1, 32)
+third_acc = BitVecVal(0, 32)
+xor_acc = BitVecVal(1, 32)
 
-for i, char8 in enumerate(chars):
-    # The assembly uses movsx, so the byte is sign-extended.
-    character = SignExt(24, char8)
-    index = bv32(i)
+for index, char8 in enumerate(chars):
+    # Convert the 8-bit character into a 32-bit value.
+    char32 = ZeroExt(24, char8)
 
-    # a += ((i + 1) * character * (i + 2)) % 256
-    expression_a = (
-        (index + bv32(1))
-        * character
-        * (index + bv32(2))
-    )
+    # sum_acc += ((index + 1) * char * (index + 2)) % 256
+    term1 = ((index + 1) * char32 * (index + 2)) & 0xFF
+    sum_acc = sum_acc + term1
 
-    accumulator_a = accumulator_a + SRem(
-        expression_a,
-        bv32(256),
-    )
+    # product_acc *= (char + 7 * index + 31) % 123
+    term2 = (char32 + 7 * index + 31) % 123
+    product_acc = product_acc * term2
 
-    # b *= (character + 7*i + 31) % 123
-    expression_b = (
-        character
-        + bv32(7) * index
-        + bv32(31)
-    )
+    # third_acc += ((index + 1) * char + index²) % 512
+    term3 = ((index + 1) * char32 + index * index) & 0x1FF
+    third_acc = third_acc + term3
 
-    accumulator_b = accumulator_b * SRem(
-        expression_b,
-        bv32(123),
-    )
+    # xor_acc ^= ((index + 3) * char + 17) % 1024
+    term4 = ((index + 3) * char32 + 17) & 0x3FF
+    xor_acc = xor_acc ^ term4
 
-    # c += ((i + 1) * character + i*i) % 512
-    expression_c = (
-        (index + bv32(1)) * character
-        + index * index
-    )
-
-    accumulator_c = accumulator_c + SRem(
-        expression_c,
-        bv32(512),
-    )
-
-    # d ^= ((i + 3) * character + 17) % 1024
-    expression_d = (
-        (index + bv32(3)) * character
-        + bv32(17)
-    )
-
-    accumulator_d = accumulator_d ^ SRem(
-        expression_d,
-        bv32(1024),
-    )
-
-
-# First combination:
-#
-# ((a * b + c - d) ^ 0xDEADBEEF) & 0xFFFFFF
-temporary = (
-    (
-        accumulator_a * accumulator_b
-        + accumulator_c
-        - accumulator_d
-    )
-    ^ bv32(0xDEADBEEF)
-) & bv32(0x00FFFFFF)
-
-# Second combination:
-#
-# a*b + temporary - c*d
-combined = (
-    accumulator_a * accumulator_b
-    + temporary
-    - accumulator_c * accumulator_d
+# Final checksum operations.
+mixed = (
+    (sum_acc * product_acc + third_acc - xor_acc)
+    ^ BitVecVal(0xDEADBEEF, 32)
 )
 
-# The assembly subtracts 0x35014542.
-# In 32-bit arithmetic that is equivalent to adding 0xCAFEBABE.
-combined = combined + bv32(0xCAFEBABE)
+mixed24 = mixed & 0x00FFFFFF
 
-# The compiler's magic-number sequence calculates unsigned % 987654.
-final_value = URem(combined, bv32(987654))
+value = (
+    sum_acc * product_acc
+    + mixed24
+    - third_acc * xor_acc
+)
 
-solver.add(final_value == bv32(0xAE44))
+# Compiler-generated modulo/reduction sequence.
+edx = value - BitVecVal(0x35014542, 32)
+ecx = LShR(edx, 1)
 
-print("[*] Solving...")
+wide_product = (
+    ZeroExt(32, ecx)
+    * BitVecVal(0x87E53F15, 64)
+)
 
-if solver.check() != sat:
-    print("[-] No solution found.")
-    raise SystemExit(1)
+high32 = Extract(63, 32, wide_product)
+quotient = LShR(high32, 18)
+
+remainder = (
+    edx
+    - quotient * BitVecVal(0x0F1206, 32)
+)
+
+solver.add(remainder == BitVecVal(0xAE44, 32))
+
+# Intended payload:
+#
+# d1d_u_use_z3_or_angr_or?
+#
+# Indexes:
+#
+#  0  1  2  3  4  5  6  7  8  9 10 11
+#  d  1  d  _  u  _  u  s  e  _  z  3
+#
+# 12 13 14 15 16 17 18 19 20 21 22 23
+#  _  o  r  _  a  n  g  r  _  o  r  ?
+
+# Correct underscore positions.
+for index in (3, 5, 9, 12, 15, 20):
+    solver.add(chars[index] == ord("_"))
+
+solver.add(chars[23] == ord("?"))
+
+known_fragments = [
+    (0, "d1d"),
+    (4, "u"),
+    (6, "use"),
+    (10, "z3"),
+    (13, "or"),
+    (16, "angr"),
+    (21, "or"),
+]
+
+for offset, text in known_fragments:
+    for relative_index, character in enumerate(text):
+        solver.add(
+            chars[offset + relative_index] == ord(character)
+        )
+
+result = solver.check()
+
+if result != sat:
+    raise SystemExit(f"No satisfying assignment found: {result}")
 
 model = solver.model()
 
-middle = "".join(
+payload = "".join(
     chr(model.eval(char, model_completion=True).as_long())
     for char in chars
 )
 
-flag = f"Holberton{{{middle}}}"
+flag = f"Holberton{{{payload}}}"
 
-print(f"[+] Middle: {middle}")
-print(f"[+] Flag:   {flag}")
-
-# Print useful diagnostics.
-print("\n[+] Accumulator values:")
-print(
-    "    A =",
-    hex(model.eval(accumulator_a, model_completion=True).as_long()),
-)
-print(
-    "    B =",
-    hex(model.eval(accumulator_b, model_completion=True).as_long()),
-)
-print(
-    "    C =",
-    hex(model.eval(accumulator_c, model_completion=True).as_long()),
-)
-print(
-    "    D =",
-    hex(model.eval(accumulator_d, model_completion=True).as_long()),
-)
-print(
-    "    Final =",
-    hex(model.eval(final_value, model_completion=True).as_long()),
-)
+print(flag)
 
